@@ -1,0 +1,23 @@
+Read PLAN.md at /home/david/work/qwen38_27B/dylan/kimi/PLAN.md for stack/layout/decisions. Project at /home/david/work/qwen38_27B/dylan/kimi/webhook-delivery (Steps 1-5 done: full service + tests green). Execute Step 6:
+
+# Step 6 — Hardening, docs, final verification
+- `cargo fmt` and `cargo clippy --all-targets -- -D warnings` — fix all warnings.
+- `README.md`: ASCII architecture diagram (api → sqlite jobs table → workers → destination; DLQ flow),
+  API reference with curl examples (POST /webhook, GET /health, GET /dlq, POST /dlq/{id}/retry),
+  env var table (name/default/meaning), security section: SSRF guard (what is blocked, the
+  ALLOW_PRIVATE_DESTINATIONS escape hatch), HMAC: show `X-Webhook-Signature` format and a short
+  Python receiver-verification snippet using hmac.compare_digest, and an "At-least-once delivery"
+  section (persist-before-ack, redelivery on crash, consumers must be idempotent).
+- `.gitignore`: target/, *.db, *.db-shm, *.db-wal.
+- `Dockerfile`: multi-stage — `FROM rust:1-slim AS builder` (cargo build --release), runtime
+  `FROM debian:bookworm-slim` (or gcr.io/distroless/cc-debian12), copy binary, EXPOSE 3000, ENV defaults, CMD.
+- `scripts/smoke.sh` (chmod +x): starts the server with a temp db + ALLOW_PRIVATE_DESTINATIONS=true +
+  low retry timings, starts a python3 sink that logs requests, POSTs /webhook to the sink, polls,
+  prints sink log; then POSTs one to a dead port with MAX_ATTEMPTS=2 and polls GET /dlq until it
+  appears; then POST /dlq/{id}/retry. Use curl + jq if available (fall back to python for JSON parsing).
+  The script must be idempotent and clean up processes on exit (trap).
+- Run the smoke script end-to-end and paste its output.
+- Final: full `cargo test` from clean state; paste the complete summary.
+# Report back
+Reply to parent with: clippy output, test summary, smoke output, list of all final files, and ANY
+deviations from PLAN.md accumulated across the whole build.

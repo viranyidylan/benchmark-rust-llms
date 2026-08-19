@@ -1,0 +1,38 @@
+[package]
+name = "webhook-delivery"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "webhook_delivery"
+path = "src/lib.rs"
+
+[[bin]]
+name = "webhook-delivery"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "uuid", "migrate", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+thiserror = "2"
+anyhow = "1"
+ipnetwork = "0.20"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+fastrand = "2"
+tokio-util = "0.7"
+tower-http = { version = "0.5", features = ["trace"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"

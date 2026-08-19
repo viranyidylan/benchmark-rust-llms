@@ -1,0 +1,54 @@
+Read PLAN.md at /home/david/work/qwen38_27B/dylan/kimi/PLAN.md for stack/layout/decisions. Project at /home/david/work/qwen38_27B/dylan/kimi/webhook-delivery (Steps 1-4 done: scaffold, db, security, HTTP API with build_router + AppState). Execute Step 5:
+
+# Step 5 — Delivery worker with retries, backoff, DLQ
+Replace the `src/worker.rs` stub and finish `src/main.rs`.
+
+- `pub fn spawn_workers(state: AppState, shutdown: CancellationToken) -> Vec<JoinHandle<()>>`:
+  spawn `state.config.worker_concurrency` tasks. Each task builds ONE `reqwest::Client`
+  (`default_features=false` + rustls per Cargo.toml; `.timeout(Duration::from_secs(config.request_timeout_secs))`,
+  `.redirect(reqwest::redirect::Policy::none())`) and loops:
+  `tokio::select! { _ = shutdown.cancelled() => break, res = run_batch(...) => ... }` — simplest correct
+  structure: loop { if shutdown.is_cancelled() { break } let jobs = db.claim_due_jobs(8).await; if jobs.is_empty()
+  { tokio::select! { _ = shutdown.cancelled() => break, _ = sleep(poll_ms) => {} } continue; }
+  for job in jobs { handle_one(&client, &state, &job).await; } } — sequential-per-task is fine.
+- `async fn handle_one(client, state, job)`: call `deliver`; on Ok → `db.mark_delivered(job.id)`;
+  on Err(e): if `job.attempts >= job.max_attempts` → `db.mark_dead(job.id, &e.to_string())` (DLQ);
+  else `db.reschedule_job(job.id, Utc::now() + backoff(job.attempts, base_ms, max_ms), &e.to_string())`.
+  Note: attempts was already incremented by claim_due_jobs, so job.attempts is the attempt just made.
+- `fn backoff(attempts: i64, base_ms: u64, max_ms: u64) -> Duration`:
+  `base * 2^(attempts-1)` (saturating, cap the shift at ~20 to avoid overflow), cap at max_ms, then apply
+  ±20% jitter with `fastrand`: `let j = fastrand::f64() * 0.4 - 0.2; ms = ms * (1.0 + j)`.
+- `async fn deliver(client: &reqwest::Client, job: &Job, config: &Config) -> Result<(), DeliveryError>`
+  (DeliveryError: thiserror enum with `Http(u16)` and `Transport(String)`): POST `job.destination` with
+  body = compact-serialized `job.payload`, headers `content-type: application/json`,
+  `x-webhook-id: <uuid>`, `x-webhook-signature: <security::sign_body(&config.hmac_secret, body_bytes)>`.
+  2xx → Ok(()); other status → Err(Http(status)); request error/timeout → Err(Transport).
+- tracing: `info!` on delivered (id, destination, attempts), `warn!` on retry (id, attempt, error,
+  next delay), `error!` on dead-letter (id, attempts, error). NEVER log payload bodies or the HMAC secret.
+- `src/main.rs`: replace the TODO — create `CancellationToken::new()`, `spawn_workers(state.clone(), token.clone())`,
+  serve with `axum::serve(listener, router).with_graceful_shutdown(async move { tokio::signal::ctrl_c().await.ok(); })`,
+  then after serve completes: cancel the token and await all worker handles (with a short timeout).
+- Integration test `tests/delivery.rs` (dev-dep wiremock 0.6 is available):
+  - Shared helper (duplicate the spawn_app helper from webhook_api.rs — fine, or move it to
+    tests/common/mod.rs and import from both test files).
+  - Config for tests: allow_private_destinations=true, base_delay_ms=50, max_delay_ms=200,
+    max_attempts=3, worker_poll_ms=50, worker_concurrency=1, request_timeout_secs=2, temp-file sqlite.
+  - Spawn the FULL app: router + `spawn_workers`. Polling helper: `wait_until(cond, 10s)` looping with 50ms sleeps.
+  - Case (a): wiremock expecting POST with body `{"hello":"world"}` returning 200. POST /webhook → 202.
+    Wait until mock received 1 request; verify body equals the payload JSON, `x-webhook-id` header is the
+    returned uuid, and `x-webhook-signature` starts with `sha256=` and matches
+    `security::sign_body(config.hmac_secret, body)` (import from the lib crate).
+  - Case (b): mock returns 500 for first 2 requests then 200 (wiremock: use two mocks with `up_to_n_times`
+    or a stateful responder — simplest: `Mock::given(method("POST")).respond_with(...)` with
+    `.expect(...)`... if sequencing is awkward, use a tiny axum sink server with an AtomicUsize counting
+    requests and returning 500 until count>=3 — the axum sink approach is acceptable and simpler).
+    Assert delivered after exactly 3 requests.
+  - Case (c): sink always 500. POST /webhook, wait until GET /dlq shows the job with attempts==3 and a
+    last_error. Then flip the sink to 200, POST /dlq/{id}/retry → 200, wait until the sink receives a 4th
+    request (delivered).
+  - All waits must be bounded polling loops, never fixed long sleeps.
+# Verification
+`cargo test` passes from the project dir (system cargo, generous timeouts — wiremock pulls deps).
+# Report back
+Reply to parent with: test output tail, worker/backoff/deliver signatures, any deviations.
+Do NOT proceed to Step 6.

@@ -1,0 +1,42 @@
+Read PLAN.md at /home/david/work/qwen38_27B/dylan/kimi/PLAN.md for the fixed stack, layout, and design decisions. The project already exists at /home/david/work/qwen38_27B/dylan/kimi/webhook-delivery (Step 1 scaffolded it: Cargo.toml, lib.rs, config.rs, models.rs, error.rs, stubs). Execute Step 2 of the plan:
+
+# Step 2 — Database layer + migration
+- `migrations/0001_init.sql`: table `jobs(id TEXT PRIMARY KEY, destination TEXT NOT NULL,
+  payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL, next_attempt_at TEXT NOT NULL, last_error TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`; index `idx_jobs_due` on `(status, next_attempt_at)`.
+- Replace the `src/db.rs` stub with a real implementation:
+  - `#[derive(Clone)] pub struct Db(SqlitePool)` (tuple struct or named field, your choice).
+  - `pub async fn connect(config: &Config) -> anyhow::Result<Db>`:
+    parse `config.database_url` with `SqliteConnectOptions::from_str(...)`, set
+    `.create_if_missing(true)`, `.journal_mode(SqliteJournalMode::Wal)`, `.busy_timeout(Duration::from_secs(5))`;
+    build a pool (max 5 connections); run `sqlx::migrate!("./migrations").run(&pool).await`.
+  - Methods (all `async`, return `anyhow::Result`):
+    - `insert_job(&self, id: Uuid, destination: &str, payload: &serde_json::Value, max_attempts: i64)` —
+      status 'pending', attempts 0, next_attempt_at = now, created_at = updated_at = now. Payload stored
+      as compact JSON text. Timestamps as RFC3339 UTC strings (chrono).
+    - `claim_due_jobs(&self, limit: i64) -> Vec<Job>` — use a `BEGIN IMMEDIATE` transaction
+      (`pool.begin_with("BEGIN IMMEDIATE")`): SELECT rows WHERE status='pending' AND
+      next_attempt_at <= now ORDER BY next_attempt_at LIMIT ?; UPDATE each to status='in_flight',
+      attempts=attempts+1, updated_at=now; COMMIT; map rows to `Job` (parse payload JSON, parse
+      timestamps, JobStatus::from_str).
+    - `mark_delivered(&self, id: Uuid)` — status='delivered', last_error=NULL, updated_at=now.
+    - `reschedule_job(&self, id: Uuid, next_attempt_at: DateTime<Utc>, error: &str)` —
+      status='pending', next_attempt_at=?, last_error=?, updated_at=now.
+    - `mark_dead(&self, id: Uuid, error: &str)` — status='dead', last_error=?, updated_at=now.
+    - `list_dead(&self, limit: i64) -> Vec<Job>` — status='dead' ORDER BY updated_at DESC LIMIT ?.
+    - `requeue_dead(&self, id: Uuid) -> bool` — UPDATE SET status='pending', attempts=0,
+      next_attempt_at=now, last_error=NULL, updated_at=now WHERE id=? AND status='dead';
+      return rows_affected > 0.
+- Unit tests inside `src/db.rs` under `#[cfg(test)]` using `sqlite::memory:` (build a Config pointing
+  there or a `Db::connect_memory()` test helper): cover
+  (a) insert → claim (job returned, status in_flight, attempts=1, second claim returns empty),
+  (b) reschedule into the future → not claimed; reschedule into the past → claimed,
+  (c) mark_dead → list_dead shows it → requeue_dead returns true → claimed again;
+  requeue_dead on a non-dead job returns false.
+# Verification (must pass before you report)
+- `cargo test` (at minimum `cargo test db::`) passes, from the project dir with the system cargo.
+  Allow generous shell timeouts for compile time.
+# Report back
+Reply to your parent with: `cargo test` tail output, the final db.rs method list, and any deviations.
+Do NOT proceed to Step 3 — the parent dispatches it separately.

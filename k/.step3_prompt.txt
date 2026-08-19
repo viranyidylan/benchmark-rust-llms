@@ -1,0 +1,42 @@
+Read PLAN.md at /home/david/work/qwen38_27B/dylan/kimi/PLAN.md for stack/layout/decisions. The project exists at /home/david/work/qwen38_27B/dylan/kimi/webhook-delivery (Steps 1-2 done: scaffold, config, models, error, db). Execute Step 3:
+
+# Step 3 — Security module (SSRF guard + HMAC + limits)
+Replace the `src/security.rs` stub with:
+
+- `pub enum SecurityError` (thiserror): InvalidUrl, SchemeNotAllowed, CredentialsNotAllowed,
+  UnresolvableHost, PrivateAddressBlocked, PayloadTooLarge — each with a clear Display message.
+- `pub async fn validate_destination(url_str: &str, allow_private: bool) -> Result<Url, SecurityError>`:
+  1. Parse with `url::Url`; must be absolute with scheme http or https, else InvalidUrl/SchemeNotAllowed.
+  2. Host must be present. Username must be empty and password must be None (CredentialsNotAllowed).
+  3. If `allow_private` is true, return Ok(url) after the structural checks above (skip IP checks).
+  4. Collect candidate IPs: if host is an IP literal, just that one. If a domain, resolve with
+     `tokio::net::lookup_host((host, port))` where port = 443 for https, 80 for http (or the URL's
+     explicit port if present); DNS failure → UnresolvableHost.
+  5. Reject (PrivateAddressBlocked) if ANY candidate IP is: loopback, private (RFC1918 + CGNAT
+     100.64.0.0/10), link-local (incl. 169.254.0.0/16 — cloud metadata!), multicast, unspecified
+     (0.0.0.0), or documentation ranges... actually: use a helper `fn ip_is_blocked(ip: &IpAddr) -> bool`
+     that handles IPv4 via std `is_private/is_loopback/is_link_local/is_multicast/is_unspecified` PLUS
+     an explicit check for 100.64.0.0/10 (std doesn't cover CGNAT); for IPv6 check loopback (::1),
+     unspecified (::), link-local (fe80::/10), unique-local (fc00::/7), multicast (ff00::/8), and
+     IPv4-mapped IPv6 (`to_ipv4_mapped()` then run the v4 check).
+- `pub fn sign_body(secret: &str, body: &[u8]) -> String` using hmac+sha2+hex:
+  `format!("sha256={}", hex::encode(mac.finalize().into_bytes()))`.
+- `pub fn enforce_size(len: usize, max: usize) -> Result<(), SecurityError>` — PayloadTooLarge when len > max.
+
+Unit tests (`#[cfg(test)]`, tokio tests for the async fn). IMPORTANT: no real DNS in tests — only IP
+literals and parse-level checks:
+- rejects: `http://127.0.0.1/x`, `http://[::1]/`, `http://10.0.0.5/`, `http://172.16.0.1/`,
+  `http://192.168.1.1/`, `http://169.254.169.254/latest/meta-data`, `http://[fe80::1]/`,
+  `http://[fc00::1]/`, `http://[::ffff:127.0.0.1]/` (IPv4-mapped), `http://100.64.1.1/` (CGNAT),
+  `http://user:pass@example.com/`, `ftp://example.com/`, `not-a-url`, `http://0.0.0.0/`.
+- accepts: `http://127.0.0.1:9000/hook` and `http://[::1]:8080/` when allow_private=true;
+  `https://example.com/path` when allow_private=true (structural checks only, no DNS).
+- HMAC known-vector: secret "key", body "The quick brown fox jumps over the lazy dog" →
+  `sha256=f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8`.
+- enforce_size(101, 100) → PayloadTooLarge; enforce_size(100, 100) → Ok.
+
+# Verification
+`cargo test security::` passes (system cargo, project dir, generous timeouts).
+# Report back
+Reply to parent with the test output tail, the SecurityError variant list, and any deviations.
+Do NOT proceed to Step 4.

@@ -1,0 +1,41 @@
+Read PLAN.md at /home/david/work/qwen38_27B/dylan/kimi/PLAN.md for stack/layout/decisions. Project at /home/david/work/qwen38_27B/dylan/kimi/webhook-delivery (Steps 1-3 done: scaffold, config, models, error, db with migrations, security). Execute Step 4:
+
+# Step 4 — HTTP API: POST /webhook, /health, DLQ endpoints
+Replace the `src/routes.rs` stub and wire up `src/main.rs`.
+
+- `#[derive(Clone)] pub struct AppState { pub db: Db, pub config: Arc<Config> }` in routes.rs (or a
+  small state.rs — keep it in routes.rs for simplicity).
+- Handlers:
+  - `POST /webhook`: the route must bypass axum's default 2MB body limit
+    (`.route("/webhook", post(post_webhook)).layer(DefaultBodyLimit::disable())`) and the handler takes
+    `body: Bytes` directly. First `security::enforce_size(body.len(), config.max_payload_bytes)` → 413.
+    Then `serde_json::from_slice::<WebhookRequest>` → 400 on failure. Then
+    `security::validate_destination(&req.destination, config.allow_private_destinations).await` → 400.
+    Serialize `req.data` to compact JSON, `db.insert_job(Uuid::new_v4(), &req.destination, &data, config.max_attempts)`,
+    return `(StatusCode::ACCEPTED, Json(WebhookAccepted { id }))`.
+  - `GET /health` → `Json(json!({"status":"ok"}))`.
+  - `GET /dlq` → `Json<Vec<DlqEntry>>` from `db.list_dead(100)` (map Job→DlqEntry).
+  - `POST /dlq/{id}/retry` → `db.requeue_dead(id)`; true → 200 `{"requeued":true}`, false → 404 `{"error":"..."}`.
+- `pub fn build_router(state: AppState) -> Router` with routes above + `TraceLayer::new_for_http()`.
+- `src/main.rs`: `Config::from_env()`, init tracing_subscriber (env-filter, default "info"), `Db::connect`,
+  build state + router, `tokio::net::TcpListener::bind(&config.bind_addr)`, `axum::serve`. Leave a clearly
+  marked `// TODO(step5): spawn delivery workers here` at the right spot.
+- Integration test `tests/webhook_api.rs`:
+  - Helper `spawn_app(config: Config) -> String` (base url): `Db::connect` against `sqlite::memory:`
+    (IMPORTANT: in-memory sqlite needs a pool that keeps one shared connection — if
+    max-connections=1 is needed for `:memory:` to share state, set pool max_connections=1 in a test
+    Config flag or a Db::connect_memory() helper; simplest reliable approach: use a temp file db per test
+    via std::env::temp_dir + uuid filename, and `sqlite://<path>?mode=rwc`).
+  - Build router, bind TcpListener on `127.0.0.1:0`, serve in a tokio task, return the address.
+  - Tests (use reqwest::Client):
+    a) POST /webhook `{"data":{"hello":"world"},"destination":"http://127.0.0.1:1/hook"}` with
+       allow_private_destinations=true → 202, response body has `id` that parses as a uuid.
+    b) Same but allow_private_destinations=false → 400.
+    c) Invalid JSON body → 400. Missing `destination` field → 400/422.
+    d) Config max_payload_bytes=64, send a 10KB body → 413.
+    e) GET /health → 200. GET /dlq → 200 `[]`. POST /dlq/<random-uuid>/retry → 404.
+# Verification
+`cargo test` passes from the project dir (system cargo, generous timeouts for compiling axum etc.).
+# Report back
+Reply to parent with: test output tail, route table, any deviations (esp. how you handled in-memory
+sqlite in tests). Do NOT proceed to Step 5.
